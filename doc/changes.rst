@@ -8,6 +8,19 @@ All Patsy releases are archived at Zenodo:
 .. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.592075.svg
    :target: https://doi.org/10.5281/zenodo.592075
 
+Unreleased
+----------
+
+* Added frequency-weight fitting, for data sets that have been compressed by
+  storing each distinct row once together with a non-negative integer count of
+  its occurrences. ``dmatrix`` and ``dmatrices`` accept a new
+  ``freq_weights=`` argument, and :func:`freq_dmatrix` /
+  :func:`freq_dmatrices` wrap it. All memorized state (``center``,
+  ``standardize``, ``bs``, ``cr``/``cc``/``te``, categorical levels, and
+  nested transforms) matches what the same call would have learned from the
+  physically expanded data, without materializing the expanded rows. See
+  :ref:`freq-weights`.
+
 v1.0.3
 ------
 

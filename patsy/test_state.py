@@ -205,3 +205,68 @@ def test_Standardize():
         ddof=1,
     )
     check_stateful(Standardize, True, r20, r20, center=False, rescale=False, ddof=1)
+
+
+def _check_stateful_with_weights(cls, input, weights, chunks=1, *args, **kwargs):
+    """Check that memorizing with freq weights matches replicated input.
+
+    The weighted transform sees ``input`` split into ``chunks`` pieces, each
+    tagged with its slice of ``weights``; the reference sees the physically
+    replicated rows, split the same way.
+    """
+    from patsy.freq_weights import _TRANSFORM_WEIGHTS_ATTR
+
+    input = np.asarray(input)
+    weights = np.asarray(weights)
+    expanded = np.repeat(input, weights, axis=0)
+    # Split the compressed rows (and hence the replicated rows) into pieces.
+    split_points = np.linspace(0, len(input), chunks + 1).astype(int)
+    row_bounds = list(zip(split_points[:-1], split_points[1:]))
+    expanded_bounds = [0]
+    for start, end in row_bounds:
+        expanded_bounds.append(expanded_bounds[-1] + int(weights[start:end].sum()))
+
+    t = cls()
+    ref = cls()
+    for i, (start, end) in enumerate(row_bounds):
+        exp_start, exp_end = expanded_bounds[i], expanded_bounds[i + 1]
+        setattr(t, _TRANSFORM_WEIGHTS_ATTR, weights[start:end])
+        t.memorize_chunk(input[start:end], *args, **kwargs)
+        delattr(t, _TRANSFORM_WEIGHTS_ATTR)
+        ref.memorize_chunk(expanded[exp_start:exp_end], *args, **kwargs)
+    t.memorize_finish()
+    ref.memorize_finish()
+
+    got = t.transform(input, *args, **kwargs)
+    expected = ref.transform(input, *args, **kwargs)
+    assert np.allclose(np.asarray(got), np.asarray(expected), equal_nan=True)
+
+
+def test_center_with_freq_weights():
+    x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    w = np.array([3, 0, 2, 1, 4])
+    _check_stateful_with_weights(Center, x, w)
+    _check_stateful_with_weights(Center, x, w, chunks=3)
+
+    # Zero-weight rows do not disturb the mean even when they hold NaNs.
+    x_nan = np.array([1.0, np.nan, 3.0])
+    _check_stateful_with_weights(Center, x_nan, np.array([2, 0, 3]))
+
+    # Multiple columns are centered independently.
+    x2 = np.array([[1.0, 5.0], [2.0, 6.0], [3.0, 7.0]])
+    _check_stateful_with_weights(Center, x2, w[:3])
+
+
+def test_standardize_with_freq_weights():
+    x = np.array([1.3, -10.1, 7.0, 12.0])
+    w = np.array([2, 0, 1, 3])
+    for kwargs in [
+        {},
+        {"ddof": 1},
+        {"center": False},
+        {"rescale": False},
+    ]:
+        _check_stateful_with_weights(Standardize, x, w, 1, **kwargs)
+    _check_stateful_with_weights(Standardize, x, w, 2, ddof=1)
+    x2 = np.array([[1.0, 5.0], [2.0, 6.0], [3.0, 7.0]])
+    _check_stateful_with_weights(Standardize, x2, w[:3], 2)

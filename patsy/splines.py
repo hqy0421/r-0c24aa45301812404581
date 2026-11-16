@@ -9,8 +9,13 @@ __all__ = ["bs"]
 
 import numpy as np
 
+from patsy import PatsyError
 from patsy.util import have_pandas, no_pickling, assert_no_pickling
 from patsy.state import stateful_transform
+from patsy.freq_weights import (
+    _patsy_chunk_weights,
+    _weighted_R_compat_quantile,
+)
 
 if have_pandas:
     import pandas
@@ -175,6 +180,9 @@ class BS(object):
         # There's no better way to compute exact quantiles than memorizing
         # all data.
         self._tmp.setdefault("xs", []).append(x)
+        weights = _patsy_chunk_weights(self, x.shape[0])
+        if weights is not None:
+            self._tmp.setdefault("ws", []).append(weights)
 
     def memorize_finish(self):
         tmp = self._tmp
@@ -190,6 +198,14 @@ class BS(object):
 
         # These are guaranteed to all be 1d vectors by the code above
         x = np.concatenate(tmp["xs"])
+        weights = None
+        if "ws" in tmp:
+            weights = np.concatenate(tmp["ws"])
+            if weights.shape != x.shape:  # pragma: no cover
+                raise PatsyError(
+                    "frequency weights could not be aligned with the data "
+                    "passed to 'bs'"
+                )
         if args["df"] is None and args["knots"] is None:
             raise ValueError("must specify either df or knots")
         order = args["degree"] + 1
@@ -226,17 +242,29 @@ class BS(object):
             else:
                 # Need to compute inner knots
                 knot_quantiles = np.linspace(0, 1, n_inner_knots + 2)[1:-1]
-                inner_knots = _R_compat_quantile(x, knot_quantiles)
+                if weights is None:
+                    inner_knots = _R_compat_quantile(x, knot_quantiles)
+                else:
+                    inner_knots = _weighted_R_compat_quantile(
+                        x, weights, knot_quantiles
+                    )
         if args["knots"] is not None:
             inner_knots = args["knots"]
+        # When frequency weights are in play, rows with zero weight do not
+        # exist in the replicated data set, and so they must not influence
+        # the automatically-chosen boundary knots either.
+        if weights is None:
+            x_for_bounds = x
+        else:
+            x_for_bounds = x[weights > 0]
         if args["lower_bound"] is not None:
             lower_bound = args["lower_bound"]
         else:
-            lower_bound = np.min(x)
+            lower_bound = np.min(x_for_bounds)
         if args["upper_bound"] is not None:
             upper_bound = args["upper_bound"]
         else:
-            upper_bound = np.max(x)
+            upper_bound = np.max(x_for_bounds)
         if lower_bound > upper_bound:
             raise ValueError(
                 "lower_bound > upper_bound (%r > %r)" % (lower_bound, upper_bound)
@@ -427,3 +455,30 @@ def test_bs_errors():
 # the 'rcs' function uses slightly different conventions -- in particular it
 # picks boundary knots that are not quite at the edges of the data, which
 # makes sense for a natural spline.
+
+
+def test_bs_with_freq_weights():
+    from patsy.freq_weights import _TRANSFORM_WEIGHTS_ATTR
+
+    x = np.array([0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0])
+    w = np.array([1.0, 0.0, 3.0, 2.0, 1.0, 4.0, 2.0])
+    expanded = np.repeat(x, w.astype(int))
+    for kwargs in [
+        {"df": 4},
+        {"df": 4, "degree": 1},
+        {"df": 4, "include_intercept": True},
+        {"knots": [1.5, 3.5]},
+        {"df": 4, "lower_bound": 0.0, "upper_bound": 6.0},
+    ]:
+        t = BS()
+        setattr(t, _TRANSFORM_WEIGHTS_ATTR, w)
+        t.memorize_chunk(x, **kwargs)
+        delattr(t, _TRANSFORM_WEIGHTS_ATTR)
+        t.memorize_finish()
+
+        ref = BS()
+        ref.memorize_chunk(expanded, **kwargs)
+        ref.memorize_finish()
+
+        assert np.array_equal(t._all_knots, ref._all_knots)
+        assert np.allclose(t.transform(x, **kwargs), ref.transform(x, **kwargs))

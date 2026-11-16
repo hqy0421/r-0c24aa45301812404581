@@ -23,6 +23,12 @@ Basic API
 .. autoexception:: PatsyError
    :members:
 
+Frequency weights
+-----------------
+
+.. autofunction:: freq_dmatrix
+.. autofunction:: freq_dmatrices
+
 Convenience utilities
 ---------------------
 

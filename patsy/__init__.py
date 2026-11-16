@@ -88,6 +88,8 @@ import patsy.highlevel
 
 _reexport(patsy.highlevel)
 
+import patsy.freq_weights  # noqa: F401  (internal; exports nothing of its own)
+
 import patsy.build
 
 _reexport(patsy.build)

@@ -24,6 +24,7 @@ from patsy.eval import EvalEnvironment
 from patsy.contrasts import code_contrast_matrix, Treatment
 from patsy.compat import OrderedDict
 from patsy.missing import NAAction
+from patsy.freq_weights import _validate_freq_weights
 
 if have_pandas:
     import pandas
@@ -926,6 +927,27 @@ def build_design_matrices(
        The ``NA_action`` argument.
 
     """
+    matrices, _ = _build_design_matrices_impl(
+        design_infos, data, NA_action, return_type, dtype
+    )
+    return matrices
+
+
+def _build_design_matrices_impl(
+    design_infos,
+    data,
+    NA_action="drop",
+    return_type="matrix",
+    dtype=np.dtype(float),
+    freq_weights=None,
+):
+    """Implementation of build_design_matrices with optional freq weights.
+
+    Returns ``(matrices, surviving_freq_weights)``, where the second entry is
+    ``None`` unless ``freq_weights`` was supplied. When it is supplied, the
+    weights are carried through the same missing-value row selection as the
+    design matrix, so they always describe exactly the returned rows.
+    """
     if isinstance(NA_action, str):
         NA_action = NAAction(NA_action)
     if return_type == "dataframe" and not have_pandas:
@@ -935,6 +957,8 @@ def build_design_matrices(
             "unrecognized output type %r, should be "
             "'matrix' or 'dataframe'" % (return_type,)
         )
+    if freq_weights is not None:
+        freq_weights = _validate_freq_weights(freq_weights)
     # Evaluate factors
     factor_info_to_values = {}
     factor_info_to_isNAs = {}
@@ -974,16 +998,34 @@ def build_design_matrices(
     # num_rows is None iff evaluator_to_values (and associated sets like
     # 'values') are empty, i.e., we have no actual evaluators involved
     # (formulas like "~ 1").
+    if num_rows is None and freq_weights is not None:
+        # The weights tell us how many rows the result must have, even when
+        # no factor refers to the data (as in "~ 1").
+        num_rows = len(freq_weights)
     if return_type == "dataframe" and num_rows is not None:
         if pandas_index is None:
             pandas_index = np.arange(num_rows)
         values.append(pandas_index)
         is_NAs.append(np.zeros(len(pandas_index), dtype=bool))
         origins.append(None)
+    if freq_weights is not None:
+        if num_rows is not None and len(freq_weights) != num_rows:
+            raise PatsyError(
+                "frequency weights must have one entry per data row: "
+                "expected %s entries but got %s" % (num_rows, len(freq_weights))
+            )
+        # Carried through NA handling purely so that it gets subset to the
+        # surviving rows; it contains no NAs of its own.
+        values.append(freq_weights)
+        is_NAs.append(np.zeros(len(freq_weights), dtype=bool))
+        origins.append(None)
     new_values = NA_action.handle_NA(values, is_NAs, origins)
     # NA_action may have changed the number of rows.
     if new_values:
         num_rows = new_values[0].shape[0]
+    surviving_freq_weights = None
+    if freq_weights is not None:
+        surviving_freq_weights = new_values.pop()
     if return_type == "dataframe" and num_rows is not None:
         pandas_index = new_values.pop()
     factor_info_to_values = dict(zip(factor_info_to_values, new_values))
@@ -1019,7 +1061,7 @@ def build_design_matrices(
                 matrix, columns=di.column_names, index=pandas_index
             )
             matrices[i].design_info = di
-    return matrices
+    return matrices, surviving_freq_weights
 
 
 # It should be possible to do just the factors -> factor_infos stuff

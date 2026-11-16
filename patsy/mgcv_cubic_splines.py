@@ -17,6 +17,7 @@ from patsy.util import (
     safe_string_eq,
 )
 from patsy.state import stateful_transform
+from patsy.freq_weights import _patsy_chunk_weights
 
 if have_pandas:
     import pandas
@@ -395,7 +396,12 @@ def _get_te_dmatrix(design_matrices, constraints=None):
 
 
 def _get_all_sorted_knots(
-    x, n_inner_knots=None, inner_knots=None, lower_bound=None, upper_bound=None
+    x,
+    n_inner_knots=None,
+    inner_knots=None,
+    lower_bound=None,
+    upper_bound=None,
+    weights=None,
 ):
     """Gets all knots locations with lower and upper exterior knots included.
 
@@ -409,11 +415,23 @@ def _get_all_sorted_knots(
      minimum of ``x`` values is used.
     :param upper_bound: The upper exterior knot location. If unspecified, the
      maximum of ``x`` values is used.
+    :param weights: Optional non-negative integer frequency weights, one per
+     entry of ``x``. If given, the knots are those that would be obtained by
+     physically repeating each ``x`` value ``weights[i]`` times. (Note that
+     native patsy computes interior knots from the *unique* data values, so
+     replication only affects which values are present, not how they are
+     weighted.)
     :return: The array of ``n_inner_knots + 2`` distinct knots.
 
     :raise ValueError: for various invalid parameters sets or if unable to
      compute ``n_inner_knots + 2`` distinct knots.
     """
+    if weights is not None:
+        weights = np.asarray(weights)
+        if weights.shape != x.shape:  # pragma: no cover
+            raise ValueError("weights and data must have the same length")
+        # Zero-weight rows do not occur in the replicated data.
+        x = x[weights > 0]
     if lower_bound is None and x.size == 0:
         raise ValueError(
             "Cannot set lower exterior knot location: empty "
@@ -552,6 +570,23 @@ def _get_centering_constraint_from_dmatrix(design_matrix):
     return design_matrix.mean(axis=0).reshape((1, design_matrix.shape[1]))
 
 
+def _weighted_centering_constraint(design_matrix, weights):
+    """Weighted version of :func:`_get_centering_constraint_from_dmatrix`.
+
+    Computes the mean of each column over the data where each row is
+    repeated ``weights[i]`` times.
+    """
+    weights = np.asarray(weights, dtype=float)
+    keep = weights > 0
+    if not np.any(keep):
+        raise ValueError("frequency weights must contain at least one positive entry")
+    design_matrix = design_matrix[keep]
+    weights = weights[keep]
+    total = np.sum(weights)
+    means = np.sum(design_matrix * weights[:, None], axis=0) / total
+    return means.reshape((1, design_matrix.shape[1]))
+
+
 class CubicRegressionSpline(object):
     """Base class for cubic regression spline stateful transforms
 
@@ -628,14 +663,25 @@ class CubicRegressionSpline(object):
             )
 
         self._tmp.setdefault("xs", []).append(x)
+        chunk_weights = _patsy_chunk_weights(self, x.shape[0])
+        if chunk_weights is not None:
+            self._tmp.setdefault("ws", []).append(chunk_weights)
 
     def memorize_finish(self):
         args = self._tmp["args"]
         xs = self._tmp["xs"]
+        weights = None
+        if "ws" in self._tmp:
+            weights = np.concatenate(self._tmp["ws"])
         # Guards against invalid subsequent memorize_chunk() calls.
         del self._tmp
 
         x = np.concatenate(xs)
+        if weights is not None and weights.shape != x.shape:  # pragma: no cover
+            raise ValueError(
+                "frequency weights could not be aligned with the data passed "
+                "to %r" % (self._name,)
+            )
         if args["df"] is None and args["knots"] is None:
             raise ValueError("Must specify either 'df' or 'knots'.")
 
@@ -671,13 +717,16 @@ class CubicRegressionSpline(object):
             inner_knots=args["knots"],
             lower_bound=args["lower_bound"],
             upper_bound=args["upper_bound"],
+            weights=weights,
         )
         if constraints is not None:
             if safe_string_eq(constraints, "center"):
                 # Now we can compute centering constraints
-                constraints = _get_centering_constraint_from_dmatrix(
-                    _get_free_crs_dmatrix(x, self._all_knots, cyclic=self._cyclic)
-                )
+                free_dm = _get_free_crs_dmatrix(x, self._all_knots, cyclic=self._cyclic)
+                if weights is None:
+                    constraints = _get_centering_constraint_from_dmatrix(free_dm)
+                else:
+                    constraints = _weighted_centering_constraint(free_dm, weights)
 
             df_before_constraints = self._all_knots.size
             if self._cyclic:
@@ -963,10 +1012,16 @@ class TE(object):
                 args_2d.append(arg)
 
             tp = _row_tensor_product(args_2d)
-            self._tmp.setdefault("count", 0)
-            self._tmp["count"] += tp.shape[0]
-
-            chunk_sum = np.atleast_2d(tp.sum(axis=0))
+            weights = _patsy_chunk_weights(self, tp.shape[0])
+            if weights is None:
+                self._tmp.setdefault("count", 0)
+                self._tmp["count"] += tp.shape[0]
+                chunk_sum = np.atleast_2d(tp.sum(axis=0))
+            else:
+                weights = np.asarray(weights, dtype=float)
+                self._tmp.setdefault("count", 0.0)
+                self._tmp["count"] += np.sum(weights)
+                chunk_sum = np.atleast_2d(np.sum(tp * weights[:, None], axis=0))
             self._tmp.setdefault("sum", np.zeros(chunk_sum.shape))
             self._tmp["sum"] += chunk_sum
 
@@ -1251,3 +1306,72 @@ def test_te_3smooths():
     )
     design_matrix = build_design_matrices([builder], new_data)[0]
     assert np.allclose(design_matrix, design_matrix_R, rtol=1e-12, atol=0.0)
+
+
+def test_crs_with_freq_weights():
+    from patsy.freq_weights import _TRANSFORM_WEIGHTS_ATTR
+
+    x = np.array([0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0])
+    w = np.array([1.0, 0.0, 3.0, 2.0, 1.0, 4.0, 2.0])
+    expanded = np.repeat(x, w.astype(int))
+    for cls in (CR, CC):
+        for kwargs in [
+            {"df": 4},
+            {"df": 4, "constraints": "center"},
+            {"knots": [1.25, 2.25, 3.25]},
+        ]:
+            t = cls()
+            setattr(t, _TRANSFORM_WEIGHTS_ATTR, w)
+            t.memorize_chunk(x, **kwargs)
+            delattr(t, _TRANSFORM_WEIGHTS_ATTR)
+            t.memorize_finish()
+
+            ref = cls()
+            ref.memorize_chunk(expanded, **kwargs)
+            ref.memorize_finish()
+
+            assert np.array_equal(t._all_knots, ref._all_knots)
+            if ref._constraints is not None:
+                assert np.allclose(t._constraints, ref._constraints)
+            assert np.allclose(t.transform(x, **kwargs), ref.transform(x, **kwargs))
+
+
+def test_te_with_freq_weights():
+    from patsy.freq_weights import _TRANSFORM_WEIGHTS_ATTR
+
+    x = np.array([0.5, 1.0, 1.5, 2.0, 2.5, 3.0])
+    z = np.array([1.0, 3.0, 2.0, 5.0, 4.0, 6.0])
+    # Use all-positive weights here: this test feeds pre-computed marginal
+    # bases into TE directly, and the unweighted cr()/cc() calls used to build
+    # them choose knots from the *unique* data values, so a zero-weight row
+    # would make the two sides disagree for reasons unrelated to TE. (In the
+    # real formula pipeline the inner cr/cc transforms receive the weights
+    # too, and zero-weight rows are removed before they see the data; see
+    # test_freq_weights_cubic_splines in highlevel.)
+    w = np.array([1.0, 2.0, 3.0, 2.0, 1.0, 4.0])
+    expanded_w = w.astype(int)
+
+    t = TE()
+    setattr(t, _TRANSFORM_WEIGHTS_ATTR, w)
+    t.memorize_chunk(cr(x, df=4), cc(z, df=4), constraints="center")
+    delattr(t, _TRANSFORM_WEIGHTS_ATTR)
+    t.memorize_finish()
+
+    # Note: cr()/cc() called above on the *compressed* data are unweighted,
+    # so use a fully native reference instead.
+    ref = TE()
+    ref.memorize_chunk(
+        cr(np.repeat(x, expanded_w), df=4),
+        cc(np.repeat(z, expanded_w), df=4),
+        constraints="center",
+    )
+    ref.memorize_finish()
+
+    got = t.transform(cr(x, df=4), cc(z, df=4), constraints="center")
+    expected = ref.transform(
+        cr(np.repeat(x, expanded_w), df=4),
+        cc(np.repeat(z, expanded_w), df=4),
+        constraints="center",
+    )
+    assert got.shape[1] == expected.shape[1]
+    assert np.allclose(got, np.asarray(expected)[np.cumsum(expanded_w) - expanded_w])

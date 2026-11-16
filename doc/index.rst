@@ -18,6 +18,7 @@ Contents:
    formulas
    categorical-coding
    stateful-transforms
+   frequency-weights
    spline-regression
    expert-model-specification
    library-developers

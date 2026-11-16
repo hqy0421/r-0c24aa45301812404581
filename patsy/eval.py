@@ -22,6 +22,7 @@ from patsy import PatsyError
 from patsy.util import PushbackAdapter, no_pickling, assert_no_pickling
 from patsy.tokens import pretty_untokenize, normalize_token_spacing, python_tokenize
 from patsy.compat import call_and_wrap_exc
+from patsy.freq_weights import _FREQ_WEIGHTS_KEY, _TRANSFORM_WEIGHTS_ATTR
 
 
 def _all_future_flags():
@@ -532,6 +533,7 @@ class EvalFactor(object):
         # Pull out all the '_patsy_stobj0__center__.transform(x)' pieces
         # to make '_patsy_stobj0__center__.memorize_chunk(x)' pieces
         state["memorize_code"] = {}
+        state["memorize_names"] = {}
         for obj_name in state["transforms"]:
             transform_calls = capture_obj_method_calls(obj_name, eval_code)
             assert len(transform_calls) == 1
@@ -545,6 +547,12 @@ class EvalFactor(object):
                 + transform_call_code[len(transform_call_name) :]
             )
             state["memorize_code"][obj_name] = memorize_code
+            # Remember which names the memorization call refers to. At
+            # memorize_chunk time this lets us tell whether the transform is
+            # being applied to data rows (in which case frequency weights
+            # apply) or to some literal expression (in which case they do
+            # not).
+            state["memorize_names"][obj_name] = set(ast_names(memorize_code))
         # Then sort the codes into bins, so that every item in bin number i
         # depends only on items in bin (i-1) or less. (By 'depends', we mean
         # that in something like:
@@ -588,12 +596,52 @@ class EvalFactor(object):
         )
 
     def memorize_chunk(self, state, which_pass, data):
+        # If the data chunk carries frequency weights (see
+        # patsy.freq_weights), make them available to the stateful transforms
+        # that are memorizing *data-derived* values from this chunk, so that
+        # all memorization passes (including nested transforms) obey them.
+        #
+        # A transform that is being applied to some literal expression rather
+        # than to a column of the data cannot be weighted row-by-row, so it
+        # must be left alone.
+        try:
+            weights = data[_FREQ_WEIGHTS_KEY]
+        except (KeyError, TypeError, IndexError):
+            weights = None
+        transform_names = set(state["transforms"])
+        for obj_name in state["pass_bins"][which_pass]:
+            transform = state["transforms"][obj_name]
+            if weights is not None and self._uses_data(
+                state["memorize_names"][obj_name] - transform_names, data
+            ):
+                setattr(transform, _TRANSFORM_WEIGHTS_ATTR, weights)
+            else:
+                try:
+                    delattr(transform, _TRANSFORM_WEIGHTS_ATTR)
+                except AttributeError:
+                    pass
         for obj_name in state["pass_bins"][which_pass]:
             self._eval(state["memorize_code"][obj_name], state, data)
+
+    @staticmethod
+    def _uses_data(names, data):
+        for name in names:
+            try:
+                if name in data:
+                    return True
+            except TypeError:  # pragma: no cover
+                pass
+        return False
 
     def memorize_finish(self, state, which_pass):
         for obj_name in state["pass_bins"][which_pass]:
             state["transforms"][obj_name].memorize_finish()
+            # The weights only matter while memorizing; don't leave a stale
+            # reference on the transform.
+            try:
+                delattr(state["transforms"][obj_name], _TRANSFORM_WEIGHTS_ATTR)
+            except AttributeError:
+                pass
 
     def eval(self, memorize_state, data):
         return self._eval(memorize_state["eval_code"], memorize_state, data)

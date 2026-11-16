@@ -35,6 +35,7 @@ from patsy.util import (
     no_pickling,
     assert_no_pickling,
 )
+from patsy.freq_weights import _patsy_chunk_weights
 
 # These are made available in the patsy.* namespace
 __all__ = [
@@ -105,8 +106,19 @@ class Center(object):
 
     def memorize_chunk(self, x):
         x = atleast_2d_column_default(x)
-        self._count += x.shape[0]
-        this_total = np.sum(x, 0, dtype=wide_dtype_for(x))
+        weights = _patsy_chunk_weights(self, x.shape[0])
+        wdtype = wide_dtype_for(x)
+        if weights is None:
+            self._count += x.shape[0]
+            this_total = np.sum(x, 0, dtype=wdtype)
+        else:
+            weights = np.asarray(weights, dtype=wdtype)
+            self._count += int(np.sum(weights))
+            # Zero-weight rows do not exist in the replicated data, so they
+            # must not contribute (and in particular a NaN there must not
+            # poison the mean: NaN * 0 is NaN, not 0).
+            keep = weights > 0
+            this_total = np.sum(x[keep] * weights[keep, None], 0, dtype=wdtype)
         # This is to handle potentially multi-column x's:
         if self._sum is None:
             self._sum = this_total
@@ -165,15 +177,31 @@ class Standardize(object):
 
     def memorize_chunk(self, x, center=True, rescale=True, ddof=0):
         x = atleast_2d_column_default(x)
+        weights = _patsy_chunk_weights(self, x.shape[0])
         if self.current_mean is None:
             self.current_mean = np.zeros(x.shape[1], dtype=wide_dtype_for(x))
             self.current_M2 = np.zeros(x.shape[1], dtype=wide_dtype_for(x))
-        # XX this can surely be vectorized but I am feeling lazy:
-        for i in range(x.shape[0]):
-            self.current_n += 1
-            delta = x[i, :] - self.current_mean
-            self.current_mean += delta / self.current_n
-            self.current_M2 += delta * (x[i, :] - self.current_mean)
+        if weights is None:
+            # XX this can surely be vectorized but I am feeling lazy:
+            for i in range(x.shape[0]):
+                self.current_n += 1
+                delta = x[i, :] - self.current_mean
+                self.current_mean += delta / self.current_n
+                self.current_M2 += delta * (x[i, :] - self.current_mean)
+        else:
+            # Same recurrence as above, but process all w copies of a row at
+            # once. This is exactly Knuth's online update for the case where
+            # the incoming "chunk" is w identical observations, so the
+            # result matches memorizing the physically replicated data.
+            weights = np.asarray(weights, dtype=float)
+            for i in range(x.shape[0]):
+                weight = weights[i]
+                if weight <= 0:
+                    continue
+                self.current_n += weight
+                delta = x[i, :] - self.current_mean
+                self.current_mean += delta * (weight / self.current_n)
+                self.current_M2 += weight * delta * (x[i, :] - self.current_mean)
 
     def memorize_finish(self):
         pass
